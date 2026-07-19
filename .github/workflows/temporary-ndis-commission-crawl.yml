@@ -1,0 +1,84 @@
+name: Temporary NDIS Commission full crawl
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "ndis-crawler-runner/**"
+      - ".github/workflows/temporary-ndis-commission-crawl.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-ndis-commission-crawl-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  crawl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Check out temporary runner branch
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "ndis-crawler-runner/pyproject.toml"
+
+      - name: Install Crawl4AI and Chromium
+        working-directory: ndis-crawler-runner
+        run: |
+          set -euo pipefail
+          uv sync --python 3.12
+          uv run crawl4ai-setup
+          uv run crawl4ai-doctor
+          uv run python -m compileall -q src
+
+      - name: Run complete NDIS Commission crawl
+        working-directory: ndis-crawler-runner
+        run: |
+          set -uo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/crawl-output/library"
+          set +e
+          uv run ndis-commission-crawl crawl \
+            --library-root "$GITHUB_WORKSPACE/crawl-output/library" \
+            --concurrency 2 \
+            --page-batch-size 12 \
+            --download-batch-size 4 \
+            --max-download-mb 150 \
+            2>&1 | tee "$GITHUB_WORKSPACE/crawl-output/crawl.log"
+          crawl_code=${PIPESTATUS[0]}
+          printf '%s\n' "$crawl_code" > "$GITHUB_WORKSPACE/crawl-output/crawl-exit-code.txt"
+          exit 0
+
+      - name: Record final queue status
+        if: always()
+        working-directory: ndis-crawler-runner
+        run: |
+          set +e
+          uv run ndis-commission-crawl status \
+            --state-db "$GITHUB_WORKSPACE/crawl-output/library/metadata/ndis_commission_crawl.db" \
+            | tee "$GITHUB_WORKSPACE/crawl-output/final-status.json"
+          find "$GITHUB_WORKSPACE/crawl-output/library/exports/ndis-commission-pdfs" \
+            -type f 2>/dev/null | sort \
+            > "$GITHUB_WORKSPACE/crawl-output/downloaded-files.txt"
+          du -sh "$GITHUB_WORKSPACE/crawl-output/library" 2>/dev/null \
+            | tee "$GITHUB_WORKSPACE/crawl-output/library-size.txt" || true
+          find "$GITHUB_WORKSPACE/crawl-output/library/objects/sha256" \
+            -type f 2>/dev/null | wc -l \
+            | tee "$GITHUB_WORKSPACE/crawl-output/unique-object-count.txt"
+
+      - name: Upload downloaded library and proof manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ndis-commission-full-crawl-${{ github.run_id }}
+          path: crawl-output/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 1
